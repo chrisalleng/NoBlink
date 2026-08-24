@@ -12,37 +12,28 @@ where the resource chain starts empty, so a change means destroy and rebuild.
 NoBlink skips that teardown and rebinds the presentation on the live actor instead. The actor is
 never destroyed, so there is nothing to blink and nothing to lose a target on.
 
-Suppression is **off by default** — loading the plugin does not change stock behaviour until you
-turn it on.
-
 ## Installation
 
 1. Open the [Releases](https://github.com/chrisalleng/NoBlink/releases) page.
 2. Download `NoBlink.dll` from the latest release's **Assets** section.
 3. Drop it into your Ashita `plugins` directory.
 4. In your Ashita boot script, add `/load NoBlink`.
-5. Turn it on with `/noblink on`.
+
+It is active as soon as it loads, for you and for everyone around you.
 
 Win32 only — an x64 build will not load.
 
 ## Commands
 
 ```
-/noblink                  # status: suppression, rebinds, held looks, parked resources
-/noblink on|off           # suppression (off by default) -- this is the feature
-/noblink watch <name>     # sample that character every frame
-/noblink watch <index>    # same, by raw entity index
-/noblink watch target     # same, latching whatever is targeted right now
-/noblink watch off        # stop watching
-/noblink res              # the watched character's attached-resource chain
-/noblink dump             # per-frame trace, only the entity/actor words that moved
-/noblink callers          # every call site that destroyed a live actor
-/noblink reset            # zero counters and restart the trace
+/noblink                  # print the commands and the current setting
+/noblink on|off           # the whole plugin
+/noblink self [on|off]    # apply it to your own character (omit to toggle)
+/noblink others [on|off]  # apply it to everyone else (omit to toggle)
 ```
 
-Everything except `on`/`off` is diagnostic. `watch` takes a character **name** by preference:
-entity indices are assigned by login order and change between sessions, and watching the wrong one
-still produces numbers that all look plausible.
+All three default to **on**. Turning `self` or `others` off leaves that half of the game behaving
+exactly as it does without the plugin, which makes it easy to see the difference side by side.
 
 ## How it works
 
