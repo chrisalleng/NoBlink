@@ -1,0 +1,6 @@
+LIBRARY NoBlink
+
+EXPORTS
+    expCreatePlugin
+    expDestroyPlugin
+    expGetInterfaceVersion

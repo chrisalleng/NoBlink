@@ -1,0 +1,7 @@
+# Build outputs (see build.ps1)
+NoBlink.dll
+NoBlink.exp
+NoBlink.lib
+NoBlink.obj
+*.pdb
+*.ilk
