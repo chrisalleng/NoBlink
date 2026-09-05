@@ -1,113 +1,84 @@
 # NoBlink
 
-An [Ashita v4](https://www.ashitaxi.com/) plugin for the Final Fantasy XI client that keeps
-characters visible, and targetable, while they change visible equipment.
+An [Ashita v4](https://www.ashitaxi.com/) plugin for Final Fantasy XI that keeps player characters
+visible and targetable while they change equipment. Win32, tested with Ashita 4.30.
 
-When someone changes a piece of visible gear, the client destroys their entire presentation and
-rebuilds it from scratch. They wink out of existence for the rebuild, and **anyone targeting them
-loses their target**. It is not lag, and it is not proportional to how much gear changed — the
-client simply has no in-place path for a gear change. Its only load path is the actor constructor,
-where the resource chain starts empty, so a change means destroy and rebuild.
-
-NoBlink skips that teardown and rebinds the presentation on the live actor instead. The actor is
-never destroyed, so there is nothing to blink and nothing to lose a target on.
-
-After the rebind completes, NoBlink also invalidates the live actor's cached locomotion clip. The
-stock rebuild normally does this by constructing a new actor; without it, a weapon-style change
-such as sword-and-shield to a two-handed weapon can keep using the old shield run animation.
-
-Lockstyle and other multi-slot appearance changes are serialized through the same safe one-slot
-path. NoBlink compares incoming appearance packets with the already-rendered entity before the
-client applies them, lets one changed model through, and queues the final look. Each remaining model
-is applied only after the prior rebind and any deferred resource loads have completed. This works
-for the local character and remote players, including lockstyle changes that do not originate from
-a local command, without handing the update back to the stock blinking teardown.
+Version **3.2** restores exposed scalp and leg geometry when removing larger equipment, refreshes
+weapon animations, handles simultaneous lockstyle changes, and preserves the camera position during
+gear swaps while locked onto a target.
 
 ## Installation
 
-1. Open the [Releases](https://github.com/chrisalleng/NoBlink/releases) page.
-2. Download `NoBlink.dll` from the latest release's **Assets** section.
-3. Drop it into your Ashita `plugins` directory.
-4. In your Ashita boot script, add `/load NoBlink`.
-
-It is active as soon as it loads, for you and for everyone around you.
-
-Win32 only — an x64 build will not load.
+Build `NoBlink.dll` or download an available build from [Releases](https://github.com/chrisalleng/NoBlink/releases).
+Place it in Ashita's `plugins` directory, then use `/load NoBlink`. Unload an already loaded version
+before loading the replacement. The plugin enables itself for your character and other players.
 
 ## Commands
 
 ```
-/noblink                  # print the commands and the current setting
-/noblink on|off           # the whole plugin
-/noblink self [on|off]    # apply it to your own character (omit to toggle)
-/noblink others [on|off]  # apply it to everyone else (omit to toggle)
+/noblink                  # show settings and commands
+/noblink on|off           # enable or disable the plugin
+/noblink self [on|off]     # apply to your character; omit value to toggle
+/noblink others [on|off]   # apply to other players; omit value to toggle
 ```
-
-All three default to **on**. Turning `self` or `others` off leaves that half of the game behaving
-exactly as it does without the plugin, which makes it easy to see the difference side by side.
 
 ## How it works
 
-Two things have to be right, and both took some finding.
+The stock gear-change path destroys and reconstructs the primary actor. NoBlink intercepts eligible
+player appearance changes and keeps that actor alive. It loads replacement resources against an
+empty look chain while retaining the old resources until replacement is ready. Readiness requires
+the expected resource count, all nine appearance completion bits, and no pending presentation task.
+A final resident-resource pass handles arrival order; newer appearances are coalesced during loading.
+Multi-slot updates are serialized, including lockstyle changes.
 
-**Release, and its ordering.** The presentation loader expects an empty resource chain, but freeing
-the old look first evicts shared resources that are about to be requested again. NoBlink detaches
-the old chain without destroying it, runs the loader against the empty head, and then appends the
-still-live old nodes behind the replacement. That empty view is important when an equipped item has
-no visual model: it forces the loader to attach the unchanged base geometry, such as a character's
-face and hair, rather than relying on the copy in the old chain. Once the replacement is complete,
-the old nodes are unlinked and freed through their virtual deleting destructor at `+0x18(1)`.
+After retiring the old resources, NoBlink rebuilds the eight equipment-coverage flags from the
+surviving resources. These flags suppress sections of the base mesh beneath equipment; retaining
+flags from a removed hat or tall boots leaves holes in the exposed character. It also invalidates
+graphics setup and the cached weapon motion selection.
 
-**Knowing when the new look is complete.** This is the subtle half. For any character who is not
-you, `FUN_01b141f0` does not do the work at all — it allocates a task, parks it at `actor+0xa08`,
-and returns. The model rebuild, every attach, and every deferred-resource registration happen later,
-inside that task. And when the task does run, any look slot whose resource is not already resident
-attaches *nothing*: it registers a completion callback and moves on, so that body part has no node
-at all until the load lands, typically some 800ms later.
+The native skeleton binder initializes new bone matrices even when the model object survives.
+NoBlink carries the current pose across a rebind of the same skeleton, preventing a temporary camera
+anchor drop while locked on. Changed skeletons, invalid matrices and mismatched bone counts are
+excluded. Actor identity and target state remain intact.
 
-So completion needs both halves. `actor+0xa08` going null says the task has run — necessary, since
-until then nothing is attached — and at that moment the nodes it bound synchronously plus the count
-it parked is exactly how many replacements must exist. Arrival against that target, counted by node
-identity, is what finally releases the old look.
+Hooks use checked retail byte signatures and restore their original bytes on unload. Unsupported
+signatures cause initialization to fail without leaving hooks installed. Non-player actors and
+ineligible appearances retain the stock behavior. A bounded hold prevents an incomplete resource
+load from retaining the old look indefinitely.
 
-Releasing on either half alone puts the character on screen without a body part. Measured per frame,
-resource count across one body swap:
+## Building and testing
 
-```
-releasing when the loader call returns     11 -> 0 -> 7 -> (825ms) -> 8 -> 9
-releasing when the task's parked
-  resources have actually arrived          11 -> 19 -> (823ms) -> 9
-```
-
-The `0` is a frame wearing nothing; the `7` is 825ms with a missing chestpiece. The second line has
-neither, and never drops below the settled count. The `19` is both looks attached at once while the
-outstanding resource loads — the deliberate trade, and the reason a body part stays on screen.
-
-## Addresses
-
-None are hardcoded. Every function is found at runtime by a byte signature that occurs exactly once
-in the image, relative call displacements wildcarded. The PC actor vtable and the resource-link
-arena are read out of relocated immediates rather than baked in, so both follow ASLR. Initialization
-verifies every resolved address lies inside the loaded `FFXiMain.dll` and refuses to hook otherwise.
-All hooks restore their original bytes on unload.
-
-This means the plugin is tied to the retail client build the signatures were taken against. If the
-client updates and a signature stops matching, it logs the failure and declines to hook rather than
-patching something it does not recognise.
-
-## Building
+Use the x86 Visual Studio developer environment with the Ashita v4 SDK:
 
 ```powershell
-.\build.ps1            # build NoBlink.dll here
-.\build.ps1 -Install   # ...and copy it into the Ashita plugins directory
+.\build.ps1 -SdkPath 'C:\ffxi\Ashita-v4beta\plugins\sdk'
+.\build.ps1 -SdkPath 'C:\ffxi\Ashita-v4beta\plugins\sdk' -Install
 ```
 
-Requires the Ashita v4 SDK and a Win32 MSVC toolchain — build from `vcvars32.bat`, not the x64
-environment. Both paths are `build.ps1` parameters if yours differ from the defaults. The build
-runs the appearance-policy regression checks before compiling the plugin. Ashita needs all three
-exports in `exports.def`; omitting `expDestroyPlugin` fails with a misleading "missing required
-exports".
+The build runs `NoBlinkPolicyTest.cpp` and `NoBlinkRuntimeTest.cpp` before compiling the DLL.
+`-Install` stages a separate file and replaces the destination without truncating a mapped DLL.
+Installation failure leaves the existing file intact. Reload the plugin to activate a replacement.
+
+The portable policy tests can also run with:
+
+```sh
+g++ -std=c++20 -Wall -Wextra -Werror -pedantic NoBlinkPolicyTest.cpp -o /tmp/noblink-policy-test
+/tmp/noblink-policy-test
+```
+
+The runtime test requires Win32 and the SDK. It exercises production rebind, coverage and pose
+logic using controlled resource-loading fixtures. These tests complement in-game acceptance:
+
+- Large and small modeled hats to no hat: complete scalp/hair, no blink or lost target.
+- Tall boots to shorter boots: continuous exposed legs.
+- Shield to two-handed weapon: correct weapon animation.
+- Multiple lockstyle changes: complete appearance without blinking or target loss.
+- Own gear swap while locked onto a target: no camera dip into the floor.
+
+All five checks passed in the user's Ashita 4.30 session. Temporary render/camera probes used during
+diagnosis are excluded from the release source. See [validation notes](docs/rebind-validation.md)
+for the native evidence and test limits. Do not bundle `msvcp140.dll` or `vcruntime140.dll`.
 
 ## License
 
-Licensed under the [GNU General Public License v3.0 only](LICENSE).
+[GNU General Public License v3.0 only](LICENSE).

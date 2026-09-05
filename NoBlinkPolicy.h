@@ -14,4 +14,10 @@ namespace NoBlinkPolicy
     {
         return changedSlots > 1;
     }
+
+    constexpr bool ReplacementReady(const uint32_t arrived, const uint32_t expected,
+        const uint32_t completionMask, const bool taskPending)
+    {
+        return !taskPending && arrived >= expected && (completionMask & 0x1FFu) == 0x1FFu;
+    }
 }

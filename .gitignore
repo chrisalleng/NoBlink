@@ -7,3 +7,12 @@ NoBlinkPolicyTest.exe
 NoBlinkPolicyTest.obj
 *.pdb
 *.ilk
+
+NoBlinkRuntimeTest.exe
+NoBlinkRuntimeTest.obj
+NoBlinkRuntimeTest.lib
+NoBlinkRuntimeTest.exp
+
+# Local loader dependencies; never distribute with the plugin.
+msvcp140.dll
+vcruntime140.dll
