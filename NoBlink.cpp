@@ -7,27 +7,21 @@
  * so a change means destroying the whole presentation and rebuilding it. That rebuild is the
  * blink, and it is why anyone targeting the character loses their target.
  *
- * NoBlink hooks the teardown and rebinds on the live actor instead. Two things make that work,
- * and both are easy to get subtly wrong:
- *
- *   Ordering. The loader only ever APPENDS, so the old look must be released or the character
- *   wears both garments. But most resources are shared across a swap and releasing one drops
- *   its last reference, so releasing first evicts resources that are about to be re-requested.
- *   New look first, then unlink each old node.
- *
- *   Completion. For anyone but the current/self actor, FUN_01b141f0 does not do the work at
- *   all -- it queues a task at actor+0xa08 and returns. When that task runs, any slot whose
- *   resource is not resident attaches NOTHING; it parks a callback and moves on. So the old
- *   look must be held until the task has run AND everything it parked has arrived. Releasing
- *   on either condition alone puts the character on screen without a body part.
+ * Keep the actor alive, retain the old look until replacement is ready, rebuild equipment
+ * coverage, and carry the current skeleton pose across the load to preserve camera anchors.
  */
 
 #include "Ashita.h"
 #include "Commands.h"
+#include "NoBlinkActorState.h"
+#include "NoBlinkChain.h"
+#include "NoBlinkCoverage.h"
+#include "NoBlinkPolicy.h"
 
 #include <psapi.h>
 
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -41,7 +35,9 @@ namespace
     // Entity
     constexpr size_t kEntityActor      = 0xA0;
     constexpr size_t kEntityType       = 0xEE;   // 0 = PC
+    constexpr size_t kEntityActorLock  = 0xF2;   // lockstyle owns the visible appearance
     constexpr size_t kEntityModelFlags = 0xF4;
+    constexpr size_t kEntityLook       = 0xFC;
     constexpr size_t kEntityFlags0     = 0x120;
 
     // Actor. The model-list owner is built in place by FUN_01a6b3e0; FUN_01a6b480 empties a
@@ -60,6 +56,8 @@ namespace
 
     // Ceiling on a hold, so a resource that never arrives cannot strand the old look.
     constexpr uint32_t kHoldMaxFrames = 150;
+    constexpr uint32_t kPendingCount  = 64;
+    constexpr uint32_t kVisibleSlots  = 8;
 
     constexpr int32_t kSelector = -1;   // re-read the entity's current packed look slots
 
@@ -104,16 +102,19 @@ namespace
     std::atomic<bool> g_Self{true};
     std::atomic<bool> g_Others{true};
 
+    struct PendingAppearance
+    {
+        void* Entity;
+        uint16_t Desired[kVisibleSlots];
+    };
+    PendingAppearance g_Pending[kPendingCount]{};
+    SRWLOCK g_PendingLock = SRWLOCK_INIT;
+
     // Refreshed each frame so the teardown hook can tell self from everyone else without
     // calling into Ashita from inside the hook.
     std::atomic<void*> g_SelfEntity{nullptr};
 
-    /**
-     * An old look kept attached until its replacement is complete.
-     *
-     * Parked is per-hold, not global: several characters can be mid-swap at once, and a shared
-     * counter would let one swap's parked resources decide another's release.
-     */
+    /** Old look resources retained on the initialized base model until replacement completes. */
     struct Hold
     {
         void* Entity;
@@ -122,9 +123,11 @@ namespace
         void* Nodes[kMaxNodes];
         uint32_t Count;
         uint32_t Parked;     // resources this swap deferred, counted by the park hook
-        uint32_t Expected;    // replacement nodes required; resolved when the task finishes
-        bool TaskDone;
+        uint32_t Expected;
         uint32_t Frames;
+        uint32_t LastArrived;
+        bool FinalPass;
+        uint16_t Look[kVisibleSlots + 1]; // includes race/face, not just equipment
     };
     Hold g_Holds[4]{};
 
@@ -169,54 +172,100 @@ namespace
         return reinterpret_cast<DeletingDtor_t>(vtable[kDeletingDtorSlot / sizeof(void*)]);
     }
 
-    /**
-     * Records every node currently attached, refusing on anything unreadable. Runs before any
-     * mutation, so a layout surprise can still fall through to a fully stock teardown.
-     */
     bool Snapshot(void* model, void* out[kMaxNodes], uint32_t& count)
     {
         count = 0;
         for (void* node = *ResourceHead(model); node != nullptr; node = *NextLink(node))
         {
-            if (count >= kMaxNodes || ::IsBadReadPtr(node, kChainNext + sizeof(void*)))
-                return false;
-            if (ChainDtor(node) == nullptr)
+            if (count >= kMaxNodes || ::IsBadReadPtr(node, kChainNext + sizeof(void*)) ||
+                ChainDtor(node) == nullptr)
                 return false;
             out[count++] = node;
         }
         return true;
     }
 
-    /**
-     * Nodes present that are not in the recorded set: the replacements bound so far. New nodes
-     * are inserted in descriptor order rather than appended, so this counts by identity and
-     * never by length or position.
-     */
+    template <typename T>
+    bool TryRead(const void* base, const size_t offset, T& out)
+    {
+        const uintptr_t address = reinterpret_cast<uintptr_t>(base);
+        if (base == nullptr || offset > UINTPTR_MAX - address ||
+            sizeof(T) > UINTPTR_MAX - (address + offset) ||
+            ::IsBadReadPtr(reinterpret_cast<const void*>(address + offset), sizeof(T)))
+            return false;
+        std::memcpy(&out, reinterpret_cast<const void*>(address + offset), sizeof(T));
+        return true;
+    }
+
+    #include "NoBlinkPose.h"
+
+    bool RebuildCoverage(void* actor)
+    {
+        // Build from the surviving resource chain only. Retained old gear must already be gone,
+        // otherwise its coverage will immediately hide the newly exposed base mesh again.
+        uint8_t flags[NoBlinkCoverage::kCount]{};
+        void* models[16]{};
+        void* model = nullptr;
+        if (!TryRead(actor, kActorModelOwner + kModelChainRoot, model) || model == nullptr)
+            return false;
+        uint32_t outer = 0;
+        while (model != nullptr)
+        {
+            if (outer == 16) return false;
+            for (uint32_t i = 0; i < outer; ++i) if (models[i] == model) return false;
+            models[outer++] = model;
+            void* nodes[kMaxNodes]{};
+            uint32_t count = 0;
+            void* node = nullptr;
+            if (!TryRead(model, kModelResources, node)) return false;
+            while (node != nullptr)
+            {
+                if (count == kMaxNodes) return false;
+                for (uint32_t i = 0; i < count; ++i) if (nodes[i] == node) return false;
+                nodes[count++] = node;
+                void* handle = nullptr;
+                void* source = nullptr;
+                uint32_t presentation = 0;
+                uint8_t kind = 0, type = 0;
+                if (!TryRead(node, 0x0C, presentation)) return false;
+                if (presentation == 0)
+                {
+                    if (!TryRead(node, 8, handle) || !TryRead(handle, 0, source) ||
+                        !TryRead(source, 0x32, kind)) return false;
+                    if ((kind & 0x7F) == 0)
+                    {
+                        if (!TryRead(source, 0x33, type)) return false;
+                        NoBlinkCoverage::Accumulate(type, flags);
+                    }
+                }
+                if (!TryRead(node, kChainNext, node)) return false;
+            }
+            if (!TryRead(model, kChainNext, model)) return false;
+        }
+        // Validate the entire walk before changing exactly eight bytes. Seed all current coverage
+        // before any resource draws, so base-first order cannot briefly expose skin beneath gear.
+        NoBlinkCoverage::Publish(static_cast<uint8_t*>(actor), flags);
+        return true;
+    }
+
     uint32_t CountFresh(void* head, void* const* recorded, const uint32_t recordedCount)
     {
         uint32_t fresh = 0;
-        void* node     = head;
+        void* node = head;
         for (uint32_t guard = 0; node != nullptr && guard < kMaxWalk; ++guard)
         {
             if (::IsBadReadPtr(node, kChainNext + sizeof(void*)))
                 break;
-
             bool known = false;
             for (uint32_t i = 0; i < recordedCount && !known; ++i)
                 known = recorded[i] == node;
             if (!known)
                 ++fresh;
-
             node = *NextLink(node);
         }
         return fresh;
     }
 
-    /**
-     * Unlinks one exact node and frees it, as FUN_01a69e40 does: relink the predecessor past
-     * it, detach its successor so only this node dies, then delete through +0x18. A node no
-     * longer present is left alone.
-     */
     void UnlinkAndFree(void** head, void* target)
     {
         void** link = head;
@@ -233,8 +282,8 @@ namespace
                 auto dtor = ChainDtor(cur);
                 if (dtor == nullptr)
                     return;
-                *link            = *NextLink(cur);
-                *NextLink(cur)   = nullptr;
+                *link = *NextLink(cur);
+                *NextLink(cur) = nullptr;
                 dtor(cur, 1);
                 return;
             }
@@ -249,6 +298,133 @@ namespace
             UnlinkAndFree(head, nodes[i]);
     }
 
+    void DestroyDetachedNodes(void* const* nodes, const uint32_t count)
+    {
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            void* node = nodes[i];
+            if (node == nullptr || ::IsBadReadPtr(node, kChainNext + sizeof(void*)))
+                continue;
+            auto dtor = ChainDtor(node);
+            if (dtor == nullptr)
+                continue;
+            *NextLink(node) = nullptr;
+            dtor(node, 1);
+        }
+    }
+
+    bool QueueAppearance(void* entity, const uint16_t desired[kVisibleSlots])
+    {
+        ::AcquireSRWLockExclusive(&g_PendingLock);
+        PendingAppearance* available = nullptr;
+        for (auto& pending : g_Pending)
+        {
+            if (pending.Entity == entity)
+            {
+                available = &pending;
+                break;
+            }
+            if (available == nullptr && pending.Entity == nullptr)
+                available = &pending;
+        }
+
+        if (available != nullptr)
+        {
+            available->Entity = entity;
+            std::memcpy(available->Desired, desired, sizeof(available->Desired));
+        }
+        ::ReleaseSRWLockExclusive(&g_PendingLock);
+        return available != nullptr;
+    }
+
+    void CancelAppearance(void* entity)
+    {
+        ::AcquireSRWLockExclusive(&g_PendingLock);
+        for (auto& pending : g_Pending)
+        {
+            if (pending.Entity == entity)
+                pending.Entity = nullptr;
+        }
+        ::ReleaseSRWLockExclusive(&g_PendingLock);
+    }
+
+    void ClearAppearances(void)
+    {
+        ::AcquireSRWLockExclusive(&g_PendingLock);
+        for (auto& pending : g_Pending)
+            pending.Entity = nullptr;
+        ::ReleaseSRWLockExclusive(&g_PendingLock);
+    }
+
+    bool IsAppearanceQueued(void* entity)
+    {
+        bool found = false;
+        ::AcquireSRWLockShared(&g_PendingLock);
+        for (const auto& pending : g_Pending)
+        {
+            if (pending.Entity == entity)
+            {
+                found = true;
+                break;
+            }
+        }
+        ::ReleaseSRWLockShared(&g_PendingLock);
+        return found;
+    }
+
+    /**
+     * Reduces an incoming batched appearance update to one changed equipment model and queues
+     * the final look. Subsequent models are written one at a time after each rebind completes.
+     */
+    void PrepareAppearanceSequence(void* entity, uint8_t* appearance)
+    {
+        if (entity == nullptr || appearance == nullptr ||
+            Read<uint8_t>(entity, kEntityType) != 0 ||
+            Read<uint16_t>(entity, kEntityActorLock) != 0)
+            return;
+
+        void* actor = Read<void*>(entity, kEntityActor);
+        if (actor == nullptr || ::IsBadReadPtr(actor, sizeof(void*)))
+            return;   // initial spawn, not a change to an already-rendered presentation
+
+        uint16_t current[kVisibleSlots]{};
+        uint16_t desired[kVisibleSlots]{};
+        uint32_t changed = 0;
+
+        for (uint32_t slot = 0; slot < kVisibleSlots; ++slot)
+        {
+            current[slot] = Read<uint16_t>(
+                entity, kEntityLook + sizeof(uint16_t) * (slot + 1));
+            std::memcpy(&desired[slot],
+                appearance + 2 + slot * sizeof(uint16_t), sizeof(uint16_t));
+            if (current[slot] != desired[slot])
+                ++changed;
+        }
+
+        if (!NoBlinkPolicy::ShouldSerializeAppearanceChange(changed))
+        {
+            CancelAppearance(entity);
+            return;
+        }
+
+        if (!QueueAppearance(entity, desired))
+            return;
+
+        bool keptOne = false;
+        for (uint32_t slot = 0; slot < kVisibleSlots; ++slot)
+        {
+            if (current[slot] == desired[slot])
+                continue;
+            if (!keptOne)
+            {
+                keptOne = true;
+                continue;
+            }
+            std::memcpy(appearance + 2 + slot * sizeof(uint16_t),
+                &current[slot], sizeof(uint16_t));
+        }
+    }
+
     Hold* FindHold(void* actor)
     {
         for (auto& hold : g_Holds)
@@ -259,63 +435,143 @@ namespace
         return nullptr;
     }
 
-    void BeginHold(void* entity, void* actor, void* model, void* const* nodes,
-        const uint32_t count, const uint32_t parked, const uint32_t expected)
+    /** Applies at most one queued equipment model per entity after the prior rebind settles. */
+    void ProcessPendingAppearances(void)
+    {
+        if (!g_Enabled.load(std::memory_order_relaxed))
+            return;
+
+        ::AcquireSRWLockExclusive(&g_PendingLock);
+        for (auto& pending : g_Pending)
+        {
+            void* entity = pending.Entity;
+            if (entity == nullptr)
+                continue;
+
+            void* actor = Read<void*>(entity, kEntityActor);
+            if (Read<uint8_t>(entity, kEntityType) != 0 || actor == nullptr ||
+                ::IsBadReadPtr(actor, sizeof(void*)))
+            {
+                pending.Entity = nullptr;
+                continue;
+            }
+
+            const uint16_t modelFlags = Read<uint16_t>(entity, kEntityModelFlags);
+            const uint32_t flags0 = Read<uint32_t>(entity, kEntityFlags0);
+            if (modelFlags != 0 || (flags0 & 1u) != 0 ||
+                Read<void*>(actor, kActorTask) != nullptr || FindHold(actor) != nullptr)
+                continue;
+
+            uint32_t slot = 0;
+            for (; slot < kVisibleSlots; ++slot)
+            {
+                const uint16_t current = Read<uint16_t>(
+                    entity, kEntityLook + sizeof(uint16_t) * (slot + 1));
+                if (current != pending.Desired[slot])
+                    break;
+            }
+
+            if (slot == kVisibleSlots)
+            {
+                pending.Entity = nullptr;
+                continue;
+            }
+
+            std::memcpy(static_cast<uint8_t*>(entity) + kEntityLook +
+                    sizeof(uint16_t) * (slot + 1),
+                &pending.Desired[slot], sizeof(uint16_t));
+            const uint16_t refresh = 1;
+            std::memcpy(static_cast<uint8_t*>(entity) + kEntityModelFlags,
+                &refresh, sizeof(refresh));
+        }
+        ::ReleaseSRWLockExclusive(&g_PendingLock);
+    }
+
+    Hold* AvailableHold()
     {
         for (auto& hold : g_Holds)
         {
-            if (hold.Entity != nullptr)
-                continue;
-
-            hold.Entity   = entity;
-            hold.Actor    = actor;
-            hold.Model    = model;
-            hold.Count    = count;
-            hold.Parked   = parked;
-            hold.Expected = expected;
-            hold.TaskDone = expected != 0;
-            hold.Frames   = 0;
-            std::memcpy(hold.Nodes, nodes, count * sizeof(void*));
-            return;
+            if (hold.Entity == nullptr)
+                return &hold;
         }
-
-        // Every slot busy: release now rather than leak the old look permanently.
-        ReleaseNodes(model, nodes, count);
+        return nullptr;
     }
 
     /**
-     * Runs the presentation load on the live actor, then either releases the old look or holds
-     * it until the replacement is complete. The caller has already validated the chain and
-     * consumed the triggers, so this cannot refuse.
+     * Replaces the initialized model's look-resource chain. Carry its pose across the stock
+     * skeleton rebind while old look resources remain alive until replacement completes.
      */
-    void Rebind(void* entity, void* actor, void* model, void* const* nodes, const uint32_t count)
+    void Rebind(Hold& hold, void* entity, void* actor, void* model,
+        void* const* nodes, const uint32_t count, const bool finalPass = false)
     {
+        PoseSnapshot pose;
+        CapturePose(model, pose);
+        hold = {};
+        hold.Entity = entity;
+        hold.Actor = actor;
+        hold.Model = model;
+        hold.Count = count;
+        hold.FinalPass = finalPass;
+        std::memcpy(hold.Nodes, nodes, count * sizeof(void*));
+        std::memcpy(hold.Look, static_cast<uint8_t*>(entity) + kEntityLook, sizeof(hold.Look));
         void** root = ChainRoot(actor);
+        void** liveHead = ResourceHead(model);
+        void* oldHead = NoBlinkChain::Detach(*liveHead);
 
         g_ArmedActor = actor;
         g_ArmedParks = 0;
+
+        constexpr uint32_t kForceDirect = 1u << 7;
+        const uint32_t before = Read<uint32_t>(entity, kEntityFlags0);
+        const bool armed = (before & ((1u << 7) | (1u << 8))) == 0;
+        if (armed)
+        {
+            const uint32_t forced = before | kForceDirect;
+            std::memcpy(static_cast<uint8_t*>(entity) + kEntityFlags0,
+                &forced, sizeof(forced));
+        }
+
+        NoBlinkActorState::ResetAppearance(static_cast<uint8_t*>(actor));
         g_Loader(actor, nullptr, kSelector);
+        uint32_t poseChanged = 0;
+        if (root != nullptr && *root == model)
+            RestorePose(model, pose, poseChanged);
+
+        if (armed)
+        {
+            const uint32_t after = Read<uint32_t>(entity, kEntityFlags0);
+            const uint32_t restored = after & ~kForceDirect;
+            std::memcpy(static_cast<uint8_t*>(entity) + kEntityFlags0,
+                &restored, sizeof(restored));
+        }
+
         const uint32_t parked = g_ArmedParks;
-        g_ArmedActor          = nullptr;
+        g_ArmedActor = nullptr;
 
         if (root == nullptr || *root != model)
-            return;   // loader rebuilt the model; the old nodes went with it
-
-        // A queued task means nothing has happened yet, so there is nothing to compare against
-        // and no basis on which to release. Without this check the branch below fires on every
-        // remote swap and strips the character bare for a frame.
-        if (Read<void*>(actor, kActorTask) != nullptr)
         {
-            BeginHold(entity, actor, model, nodes, count, parked, 0);
+            DestroyDetachedNodes(nodes, count);
+            hold = {};
             return;
         }
 
-        // Ran inline, so the target is known now: what it attached plus what it parked.
-        const uint32_t attached = CountFresh(*ResourceHead(model), nodes, count);
-        if (parked == 0)
-            ReleaseNodes(model, nodes, count);   // complete already, no doubled window at all
-        else
-            BeginHold(entity, actor, model, nodes, count, parked, attached + parked);
+        if (!NoBlinkChain::Append(*liveHead, oldHead,
+                [](void* node) -> void*& { return *NextLink(node); },
+                [](void* node) {
+                    return node != nullptr &&
+                        !::IsBadReadPtr(node, kChainNext + sizeof(void*));
+                }, kMaxWalk))
+        {
+            DestroyDetachedNodes(nodes, count);
+            hold = {};
+            return;
+        }
+
+        const uint32_t attached = CountFresh(*liveHead, nodes, count);
+        hold.Parked = parked;
+        hold.Expected = attached + parked;
+        hold.LastArrived = attached;
+        NoBlinkActorState::InvalidateGraphics(static_cast<uint8_t*>(actor));
     }
 
     /** True if the teardown was replaced with an in-place rebind. */
@@ -332,8 +588,8 @@ namespace
         void* actor = Read<void*>(entity, kEntityActor);
         if (actor == nullptr || ::IsBadReadPtr(actor, sizeof(void*)))
             return false;
-        if (Read<uint8_t>(entity, kEntityType) != 0)
-            return false;   // PCs only; mounts and other actor families keep the stock path
+        const uint8_t entityType  = Read<uint8_t>(entity, kEntityType);
+        const uint16_t actorLock = Read<uint16_t>(entity, kEntityActorLock);
 
         // Mirror the stock trigger condition exactly.
         const uint16_t modelFlags = Read<uint16_t>(entity, kEntityModelFlags);
@@ -343,13 +599,24 @@ namespace
         if (g_Predicate(entity, nullptr) == 0)
             return false;
 
-        // Record the old look before touching anything, so an unrecognised layout can still
+        const bool serialized = IsAppearanceQueued(entity);
+        if (!NoBlinkPolicy::ShouldRebind(entityType, actorLock, serialized))
+            return false;   // non-PCs and unqueued locked presentations keep the stock behavior
+
+        // Do not reset an actor while its earlier appearance callbacks are still in flight.
+        // Leave a newer trigger pending; ServiceHolds compares the full look before rebuilding.
+        if (FindHold(actor) != nullptr)
+            return true;
+        Hold* hold = AvailableHold();
+        if (hold == nullptr || Read<void*>(actor, kActorTask) != nullptr)
+            return false; // no retention capacity: untouched stock fallback
+
+        // Validate and record the old look before touching anything, so an unrecognised layout can
         // fall through to a fully stock teardown with the entity exactly as it expects.
         void** root = ChainRoot(actor);
         if (root == nullptr || *root == nullptr ||
             ::IsBadReadPtr(*root, kModelResources + sizeof(void*)))
             return false;
-
         void* model = *root;
         void* nodes[kMaxNodes];
         uint32_t count = 0;
@@ -363,10 +630,7 @@ namespace
         std::memcpy(static_cast<uint8_t*>(entity) + kEntityModelFlags, &cleared, sizeof(cleared));
         std::memcpy(static_cast<uint8_t*>(entity) + kEntityFlags0, &newFlags, sizeof(newFlags));
 
-        if (count == 0)
-            g_Loader(actor, nullptr, kSelector);   // nothing to preserve
-        else
-            Rebind(entity, actor, model, nodes, count);
+        Rebind(*hold, entity, actor, model, nodes, count);
         return true;
     }
 
@@ -390,10 +654,94 @@ namespace
             if (actor == g_ArmedActor)
                 ++g_ArmedParks;
             else if (Hold* hold = FindHold(actor))
+            {
                 ++hold->Parked;
+                ++hold->Expected;
+            }
         }
 
         g_Park(cell, unused, callback, context, actor, flag);
+    }
+
+    /** Finalize resident resources without destroying the actor; coalesce newer looks first. */
+    void ServiceHolds(void)
+    {
+        for (auto& hold : g_Holds)
+        {
+            if (hold.Entity == nullptr)
+                continue;
+
+            hold.Frames += 1;
+            const bool expired = hold.Frames >= kHoldMaxFrames;
+
+            // Abandon if the stock path took over: the recorded nodes died with the actor/model
+            // chain, and releasing them would be a double free.
+            void** root = nullptr;
+            if (!::IsBadReadPtr(hold.Entity, kEntityLook + sizeof(hold.Look)) &&
+                Read<void*>(hold.Entity, kEntityActor) == hold.Actor)
+                root = ChainRoot(hold.Actor);
+            if (root == nullptr || *root != hold.Model)
+            {
+                hold = {};
+                continue;
+            }
+
+            const uint32_t arrived = CountFresh(
+                *ResourceHead(hold.Model), hold.Nodes, hold.Count);
+
+            if (arrived != hold.LastArrived)
+            {
+                NoBlinkActorState::InvalidateGraphics(static_cast<uint8_t*>(hold.Actor));
+                hold.LastArrived = arrived;
+            }
+            const bool ready = NoBlinkPolicy::ReplacementReady(arrived, hold.Expected,
+                Read<uint32_t>(hold.Actor, NoBlinkActorState::kAppearanceCompletionMask),
+                Read<void*>(hold.Actor, kActorTask) != nullptr);
+            if (!expired && !ready)
+                continue;
+
+            if (ready && std::memcmp(hold.Look,
+                    static_cast<uint8_t*>(hold.Entity) + kEntityLook, sizeof(hold.Look)) != 0)
+            {
+                // A newer packet arrived during preloading. Retire only the original look;
+                // keep the just-loaded resources while requesting the new desired appearance.
+                ReleaseNodes(hold.Model, hold.Nodes, hold.Count);
+                void* current[kMaxNodes];
+                uint32_t currentCount = 0;
+                if (Snapshot(hold.Model, current, currentCount))
+                {
+                    void* entity = hold.Entity;
+                    void* actor  = hold.Actor;
+                    void* model  = hold.Model;
+                    Rebind(hold, entity, actor, model, current, currentCount);
+                    continue;
+                }
+            }
+
+            if (ready && !hold.FinalPass)
+            {
+                void* current[kMaxNodes];
+                uint32_t currentCount = 0;
+                if (Snapshot(hold.Model, current, currentCount))
+                {
+                    void* entity = hold.Entity;
+                    void* actor = hold.Actor;
+                    void* model = hold.Model;
+                    Rebind(hold, entity, actor, model, current, currentCount, true);
+                    continue;
+                }
+            }
+
+            ReleaseNodes(hold.Model, hold.Nodes, hold.Count);
+            if (ready && hold.FinalPass)
+                RebuildCoverage(hold.Actor);
+            NoBlinkActorState::RequestFullRender(static_cast<uint8_t*>(hold.Actor));
+            // Existing motion-cache contract: force the next update to choose the new weapon clip.
+            constexpr uint32_t invalidMotion = 0x20202020;
+            std::memcpy(static_cast<uint8_t*>(hold.Actor) + 0x7D8,
+                &invalidMotion, sizeof(invalidMotion));
+            hold = {};
+        }
     }
 
     bool WriteCode(void* address, const void* data, const size_t size)
@@ -418,7 +766,7 @@ namespace
 
     public:
         bool Install(uint8_t* target, const void* detour, const uint8_t* entry,
-            const size_t stolen)
+            const size_t stolen, void (*publish)(void*) = nullptr)
         {
             if (target == nullptr || std::memcmp(target, entry, stolen) != 0)
                 return false;
@@ -442,6 +790,7 @@ namespace
                 static_cast<const uint8_t*>(detour) - (target + kJmpSize));
             std::memcpy(patch + 1, &hookRel, sizeof(hookRel));
 
+            if (publish != nullptr) publish(m_Tramp);
             if (!WriteCode(target, patch, kJmpSize))
             {
                 ::VirtualFree(m_Tramp, 0, MEM_RELEASE);
@@ -501,7 +850,7 @@ public:
     }
     double GetVersion(void) const override
     {
-        return 1.0;
+        return 3.2;
     }
     double GetInterfaceVersion(void) const override
     {
@@ -514,6 +863,7 @@ public:
     uint32_t GetFlags(void) const override
     {
         return static_cast<uint32_t>(Ashita::PluginFlags::UseCommands) |
+               static_cast<uint32_t>(Ashita::PluginFlags::UsePackets) |
                static_cast<uint32_t>(Ashita::PluginFlags::UseDirect3D);
     }
 
@@ -521,7 +871,6 @@ public:
     {
         m_Core   = core;
         m_Logger = logger;
-
         const uintptr_t teardown = this->Resolve("noblink_teardown", kTeardownSig);
         const uintptr_t loader   = this->Resolve("noblink_loader", kLoaderSig);
         const uintptr_t park     = this->Resolve("noblink_park", kParkSig);
@@ -545,9 +894,10 @@ public:
         g_Predicate = reinterpret_cast<Predicate_t>(predicate);
 
         if (!g_TeardownHook.Install(reinterpret_cast<uint8_t*>(teardown), &TeardownDetour,
-                kTeardownEntry, sizeof(kTeardownEntry)) ||
+                kTeardownEntry, sizeof(kTeardownEntry),
+                [](void* p) { g_Teardown = reinterpret_cast<Teardown_t>(p); }) ||
             !g_ParkHook.Install(reinterpret_cast<uint8_t*>(park), &ParkDetour, kParkEntry,
-                sizeof(kParkEntry)))
+                sizeof(kParkEntry), [](void* p) { g_Park = reinterpret_cast<Park_t>(p); }))
         {
             logger->Logf(kLogError, "NoBlink", "Unexpected code at a hook site; refusing to patch.");
             this->Release();
@@ -557,12 +907,16 @@ public:
         g_Teardown = reinterpret_cast<Teardown_t>(g_TeardownHook.Trampoline());
         g_Park     = reinterpret_cast<Park_t>(g_ParkHook.Trampoline());
 
-        logger->Logf(kLogInfo, "NoBlink", "Loaded. /noblink for commands.");
+        logger->Logf(kLogInfo, "NoBlink", "Loaded 3.2.");
         return true;
     }
 
     void Release(void) override
     {
+        ClearAppearances();
+        // Held nodes are still owned by live models; stock will release them on actor teardown.
+        for (auto& hold : g_Holds)
+            hold = {};
         g_ParkHook.Remove();
         g_TeardownHook.Remove();
         this->Cleanup();
@@ -583,7 +937,54 @@ public:
             g_SelfEntity.store(ents->GetRawEntity(party->GetMemberTargetIndex(0)),
                 std::memory_order_relaxed);
 
-        this->ServiceHolds();
+        ServiceHolds();
+        ProcessPendingAppearances();
+    }
+
+    bool HandleIncomingPacket(uint16_t id, uint32_t size, const uint8_t*, uint8_t* modified,
+        uint32_t, const uint8_t*, bool, bool blocked) override
+    {
+        if (id == 0x00A)
+        {
+            ClearAppearances();   // entity indices and actor pointers change across zones
+            for (auto& hold : g_Holds)
+                hold = {};
+            return false;
+        }
+        if (blocked || modified == nullptr || !g_Enabled.load(std::memory_order_relaxed))
+            return false;
+
+        auto* memory = m_Core->GetMemoryManager();
+        auto* party  = memory ? memory->GetParty() : nullptr;
+        auto* ents   = memory ? memory->GetEntity() : nullptr;
+        if (party == nullptr || ents == nullptr)
+            return false;
+
+        void* entity = nullptr;
+        uint8_t* appearance = nullptr;
+
+        // Self appearance update: race, face, and eight visible equipment models at +0x04.
+        if (id == 0x51 && size >= 0x16)
+        {
+            entity = ents->GetRawEntity(party->GetMemberTargetIndex(0));
+            appearance = modified + 0x04;
+        }
+        // Rendered PC update: the same appearance block starts at +0x48.
+        else if (id == 0x0D && size >= 0x5A && Read<uint16_t>(modified, 0x48) != 0)
+        {
+            const uint16_t index = Read<uint16_t>(modified, 0x08);
+            if (index < 0x400 || index >= 0x700)
+                return false;
+            entity = ents->GetRawEntity(index);
+            appearance = modified + 0x48;
+        }
+        else
+            return false;
+
+        const bool isSelf = entity == ents->GetRawEntity(party->GetMemberTargetIndex(0));
+        if ((isSelf ? g_Self : g_Others).load(std::memory_order_relaxed))
+            PrepareAppearanceSequence(entity, appearance);
+        return false;
     }
 
     bool HandleCommand(int32_t, const char* command, bool) override
@@ -591,6 +992,7 @@ public:
         std::vector<std::string> args;
         if (Ashita::Commands::GetCommandArgs(command, &args) == 0 || args.empty())
             return false;
+
         if (_stricmp(args[0].c_str(), "/noblink") != 0)
             return false;
 
@@ -607,6 +1009,8 @@ public:
         else if (_stricmp(verb, "on") == 0 || _stricmp(verb, "off") == 0)
         {
             g_Enabled.store(_stricmp(verb, "on") == 0, std::memory_order_relaxed);
+            if (!g_Enabled.load(std::memory_order_relaxed))
+                ClearAppearances();
             this->ReportState();
         }
         else if (_stricmp(verb, "self") == 0)
@@ -639,6 +1043,8 @@ private:
             this->Report("expected on, off, or nothing to toggle");
             return;
         }
+        if (!flag.load(std::memory_order_relaxed))
+            ClearAppearances();
         this->ReportState();
     }
 
@@ -657,59 +1063,6 @@ private:
         char buffer[256];
         ::sprintf_s(buffer, "[NoBlink] %s", text);
         m_Core->GetChatManager()->Write(0, false, buffer);
-    }
-
-    /**
-     * Releases each held look once its replacement is complete.
-     *
-     * The task pointer going null says the queued work has run -- necessary, because until then
-     * nothing is attached -- and at that moment what it bound plus what it parked is the target.
-     * Arrival against that target, by node identity, is what releases. Either half alone
-     * releases too early and shows the character without a body part.
-     */
-    void ServiceHolds(void)
-    {
-        for (auto& hold : g_Holds)
-        {
-            if (hold.Entity == nullptr)
-                continue;
-
-            hold.Frames += 1;
-            const bool expired = hold.Frames >= kHoldMaxFrames;
-
-            // Abandon if the stock path took over: the recorded nodes died with the old actor
-            // or the rebuilt model, and releasing them would be a double free.
-            void** root = nullptr;
-            if (Read<void*>(hold.Entity, kEntityActor) == hold.Actor)
-                root = ChainRoot(hold.Actor);
-            if (root == nullptr || *root != hold.Model)
-            {
-                hold.Entity = nullptr;
-                continue;
-            }
-
-            const uint32_t arrived = CountFresh(*ResourceHead(hold.Model), hold.Nodes, hold.Count);
-
-            if (!hold.TaskDone)
-            {
-                if (Read<void*>(hold.Actor, kActorTask) != nullptr)
-                {
-                    if (!expired)
-                        continue;
-                }
-                else
-                {
-                    hold.TaskDone = true;
-                    hold.Expected = arrived + hold.Parked;
-                }
-            }
-
-            if (!expired && arrived < hold.Expected)
-                continue;
-
-            ReleaseNodes(hold.Model, hold.Nodes, hold.Count);
-            hold.Entity = nullptr;
-        }
     }
 
     uintptr_t Resolve(const char* name, const char* signature)
