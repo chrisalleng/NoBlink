@@ -50,13 +50,13 @@ exactly as it does without the plugin, which makes it easy to see the difference
 
 Two things have to be right, and both took some finding.
 
-**Release, and its ordering.** The presentation loader only ever *appends* resources, so rebinding
-in place without releasing the old look leaves the character wearing both garments at once.
-Releasing mirrors what the client's own teardown does — the model-list owner at `actor+0x674`,
-chain root at `+0x44`, freed through the root's virtual deleting destructor at `+0x18(1)`. But
-ordering matters more than the release itself: most resources are shared across a body swap, and
-releasing one drops its last reference, so clearing the chain first evicts resources that are about
-to be re-requested. The new look is attached first, and each old node unlinked afterwards.
+**Release, and its ordering.** The presentation loader expects an empty resource chain, but freeing
+the old look first evicts shared resources that are about to be requested again. NoBlink detaches
+the old chain without destroying it, runs the loader against the empty head, and then appends the
+still-live old nodes behind the replacement. That empty view is important when an equipped item has
+no visual model: it forces the loader to attach the unchanged base geometry, such as a character's
+face and hair, rather than relying on the copy in the old chain. Once the replacement is complete,
+the old nodes are unlinked and freed through their virtual deleting destructor at `+0x18(1)`.
 
 **Knowing when the new look is complete.** This is the subtle half. For any character who is not
 you, `FUN_01b141f0` does not do the work at all — it allocates a task, parks it at `actor+0xa08`,

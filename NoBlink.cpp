@@ -10,10 +10,10 @@
  * NoBlink hooks the teardown and rebinds on the live actor instead. Two things make that work,
  * and both are easy to get subtly wrong:
  *
- *   Ordering. The loader only ever APPENDS, so the old look must be released or the character
- *   wears both garments. But most resources are shared across a swap and releasing one drops
- *   its last reference, so releasing first evicts resources that are about to be re-requested.
- *   New look first, then unlink each old node.
+ *   Ordering. The loader expects an empty chain, but freeing the old look first evicts shared
+ *   resources that are about to be requested again. Detach the old chain without destroying it,
+ *   load against the empty head, append the still-live old chain, then unlink it only after the
+ *   replacement is complete.
  *
  *   Completion. For anyone but the current/self actor, FUN_01b141f0 does not do the work at
  *   all -- it queues a task at actor+0xa08 and returns. When that task runs, any slot whose
@@ -24,6 +24,7 @@
 
 #include "Ashita.h"
 #include "Commands.h"
+#include "NoBlinkChain.h"
 #include "NoBlinkPolicy.h"
 
 #include <psapi.h>
@@ -268,6 +269,22 @@ namespace
             UnlinkAndFree(head, nodes[i]);
     }
 
+    /** Frees nodes whose chain was detached from its model before the loader ran. */
+    void DestroyDetachedNodes(void* const* nodes, const uint32_t count)
+    {
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            void* node = nodes[i];
+            if (node == nullptr || ::IsBadReadPtr(node, kChainNext + sizeof(void*)))
+                continue;
+            auto dtor = ChainDtor(node);
+            if (dtor == nullptr)
+                continue;
+            *NextLink(node) = nullptr;
+            dtor(node, 1);
+        }
+    }
+
     void InvalidateMotion(void* actor)
     {
         std::memcpy(static_cast<uint8_t*>(actor) + kActorMotionCache,
@@ -480,6 +497,12 @@ namespace
     void Rebind(void* entity, void* actor, void* model, void* const* nodes, const uint32_t count)
     {
         void** root = ChainRoot(actor);
+        void** liveHead = ResourceHead(model);
+
+        // Keep the old resources referenced, but make the loader see the empty-chain state it was
+        // designed for. This forces it to attach unchanged base geometry too (notably the face
+        // and hair needed when a modeled helm changes to a no-model head item).
+        void* oldHead = NoBlinkChain::Detach(*liveHead);
 
         g_ArmedActor = actor;
         g_ArmedParks = 0;
@@ -488,7 +511,21 @@ namespace
         g_ArmedActor          = nullptr;
 
         if (root == nullptr || *root != model)
-            return;   // loader rebuilt the model; the old nodes went with it
+        {
+            DestroyDetachedNodes(nodes, count);
+            return;   // loader rebuilt the model; the detached nodes no longer have an owner
+        }
+
+        if (!NoBlinkChain::Append(*liveHead, oldHead,
+                [](void* node) -> void*& { return *NextLink(node); },
+                [](void* node) {
+                    return node != nullptr &&
+                        !::IsBadReadPtr(node, kChainNext + sizeof(void*));
+                }, kMaxWalk))
+        {
+            DestroyDetachedNodes(nodes, count);
+            return;
+        }
 
         // A queued task means nothing has happened yet, so there is nothing to compare against
         // and no basis on which to release. Without this check the branch below fires on every
@@ -700,7 +737,7 @@ public:
     }
     double GetVersion(void) const override
     {
-        return 1.5;
+        return 1.6;
     }
     double GetInterfaceVersion(void) const override
     {
