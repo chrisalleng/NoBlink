@@ -24,6 +24,7 @@
 
 #include "Ashita.h"
 #include "Commands.h"
+#include "NoBlinkPolicy.h"
 
 #include <psapi.h>
 
@@ -41,7 +42,9 @@ namespace
     // Entity
     constexpr size_t kEntityActor      = 0xA0;
     constexpr size_t kEntityType       = 0xEE;   // 0 = PC
+    constexpr size_t kEntityActorLock  = 0xF2;   // lockstyle owns the visible appearance
     constexpr size_t kEntityModelFlags = 0xF4;
+    constexpr size_t kEntityLook       = 0xFC;
     constexpr size_t kEntityFlags0     = 0x120;
 
     // Actor. The model-list owner is built in place by FUN_01a6b3e0; FUN_01a6b480 empties a
@@ -53,6 +56,12 @@ namespace
     constexpr size_t kChainNext        = 0x04;
     constexpr size_t kModelResources   = 0x20;
     constexpr size_t kActorTask        = 0xA08;   // queued presentation task, null when done
+    constexpr size_t kActorMotionCache = 0x7D8;   // selected locomotion clip
+
+    // The stock motion controller uses four spaces as its invalid-cache marker. A live actor
+    // otherwise keeps the same generic "run" tag across a weapon-style change and returns from
+    // its cache-hit path without rebuilding the weapon-specific motion or reset state.
+    constexpr uint32_t kInvalidMotion = 0x20202020;
 
     // Walk bounds. Real chains are 9-11 nodes; these only stop a corrupt list.
     constexpr uint32_t kMaxNodes = 64;
@@ -60,6 +69,8 @@ namespace
 
     // Ceiling on a hold, so a resource that never arrives cannot strand the old look.
     constexpr uint32_t kHoldMaxFrames = 150;
+    constexpr uint32_t kPendingCount  = 64;
+    constexpr uint32_t kVisibleSlots  = 8;
 
     constexpr int32_t kSelector = -1;   // re-read the entity's current packed look slots
 
@@ -103,6 +114,14 @@ namespace
     std::atomic<bool> g_Enabled{true};
     std::atomic<bool> g_Self{true};
     std::atomic<bool> g_Others{true};
+
+    struct PendingAppearance
+    {
+        void* Entity;
+        uint16_t Desired[kVisibleSlots];
+    };
+    PendingAppearance g_Pending[kPendingCount]{};
+    SRWLOCK g_PendingLock = SRWLOCK_INIT;
 
     // Refreshed each frame so the teardown hook can tell self from everyone else without
     // calling into Ashita from inside the hook.
@@ -249,6 +268,124 @@ namespace
             UnlinkAndFree(head, nodes[i]);
     }
 
+    void InvalidateMotion(void* actor)
+    {
+        std::memcpy(static_cast<uint8_t*>(actor) + kActorMotionCache,
+            &kInvalidMotion, sizeof(kInvalidMotion));
+    }
+
+    bool QueueAppearance(void* entity, const uint16_t desired[kVisibleSlots])
+    {
+        ::AcquireSRWLockExclusive(&g_PendingLock);
+        PendingAppearance* available = nullptr;
+        for (auto& pending : g_Pending)
+        {
+            if (pending.Entity == entity)
+            {
+                available = &pending;
+                break;
+            }
+            if (available == nullptr && pending.Entity == nullptr)
+                available = &pending;
+        }
+
+        if (available != nullptr)
+        {
+            available->Entity = entity;
+            std::memcpy(available->Desired, desired, sizeof(available->Desired));
+        }
+        ::ReleaseSRWLockExclusive(&g_PendingLock);
+        return available != nullptr;
+    }
+
+    void CancelAppearance(void* entity)
+    {
+        ::AcquireSRWLockExclusive(&g_PendingLock);
+        for (auto& pending : g_Pending)
+        {
+            if (pending.Entity == entity)
+                pending.Entity = nullptr;
+        }
+        ::ReleaseSRWLockExclusive(&g_PendingLock);
+    }
+
+    void ClearAppearances(void)
+    {
+        ::AcquireSRWLockExclusive(&g_PendingLock);
+        for (auto& pending : g_Pending)
+            pending.Entity = nullptr;
+        ::ReleaseSRWLockExclusive(&g_PendingLock);
+    }
+
+    bool IsAppearanceQueued(void* entity)
+    {
+        bool found = false;
+        ::AcquireSRWLockShared(&g_PendingLock);
+        for (const auto& pending : g_Pending)
+        {
+            if (pending.Entity == entity)
+            {
+                found = true;
+                break;
+            }
+        }
+        ::ReleaseSRWLockShared(&g_PendingLock);
+        return found;
+    }
+
+    /**
+     * Reduces an incoming batched appearance update to one changed equipment model and queues
+     * the final look. Subsequent models are written one at a time after each rebind completes.
+     */
+    void PrepareAppearanceSequence(void* entity, uint8_t* appearance)
+    {
+        if (entity == nullptr || appearance == nullptr ||
+            Read<uint8_t>(entity, kEntityType) != 0 ||
+            Read<uint16_t>(entity, kEntityActorLock) != 0)
+            return;
+
+        void* actor = Read<void*>(entity, kEntityActor);
+        if (actor == nullptr || ::IsBadReadPtr(actor, sizeof(void*)))
+            return;   // initial spawn, not a change to an already-rendered presentation
+
+        uint16_t current[kVisibleSlots]{};
+        uint16_t desired[kVisibleSlots]{};
+        uint32_t changed = 0;
+
+        for (uint32_t slot = 0; slot < kVisibleSlots; ++slot)
+        {
+            current[slot] = Read<uint16_t>(
+                entity, kEntityLook + sizeof(uint16_t) * (slot + 1));
+            std::memcpy(&desired[slot],
+                appearance + 2 + slot * sizeof(uint16_t), sizeof(uint16_t));
+            if (current[slot] != desired[slot])
+                ++changed;
+        }
+
+        if (!NoBlinkPolicy::ShouldSerializeAppearanceChange(changed))
+        {
+            CancelAppearance(entity);
+            return;
+        }
+
+        if (!QueueAppearance(entity, desired))
+            return;
+
+        bool keptOne = false;
+        for (uint32_t slot = 0; slot < kVisibleSlots; ++slot)
+        {
+            if (current[slot] == desired[slot])
+                continue;
+            if (!keptOne)
+            {
+                keptOne = true;
+                continue;
+            }
+            std::memcpy(appearance + 2 + slot * sizeof(uint16_t),
+                &current[slot], sizeof(uint16_t));
+        }
+    }
+
     Hold* FindHold(void* actor)
     {
         for (auto& hold : g_Holds)
@@ -257,6 +394,58 @@ namespace
                 return &hold;
         }
         return nullptr;
+    }
+
+    /** Applies at most one queued equipment model per entity after the prior rebind settles. */
+    void ProcessPendingAppearances(void)
+    {
+        if (!g_Enabled.load(std::memory_order_relaxed))
+            return;
+
+        ::AcquireSRWLockExclusive(&g_PendingLock);
+        for (auto& pending : g_Pending)
+        {
+            void* entity = pending.Entity;
+            if (entity == nullptr)
+                continue;
+
+            void* actor = Read<void*>(entity, kEntityActor);
+            if (Read<uint8_t>(entity, kEntityType) != 0 || actor == nullptr ||
+                ::IsBadReadPtr(actor, sizeof(void*)))
+            {
+                pending.Entity = nullptr;
+                continue;
+            }
+
+            const uint16_t modelFlags = Read<uint16_t>(entity, kEntityModelFlags);
+            const uint32_t flags0 = Read<uint32_t>(entity, kEntityFlags0);
+            if (modelFlags != 0 || (flags0 & 1u) != 0 ||
+                Read<void*>(actor, kActorTask) != nullptr || FindHold(actor) != nullptr)
+                continue;
+
+            uint32_t slot = 0;
+            for (; slot < kVisibleSlots; ++slot)
+            {
+                const uint16_t current = Read<uint16_t>(
+                    entity, kEntityLook + sizeof(uint16_t) * (slot + 1));
+                if (current != pending.Desired[slot])
+                    break;
+            }
+
+            if (slot == kVisibleSlots)
+            {
+                pending.Entity = nullptr;
+                continue;
+            }
+
+            std::memcpy(static_cast<uint8_t*>(entity) + kEntityLook +
+                    sizeof(uint16_t) * (slot + 1),
+                &pending.Desired[slot], sizeof(uint16_t));
+            const uint16_t refresh = 1;
+            std::memcpy(static_cast<uint8_t*>(entity) + kEntityModelFlags,
+                &refresh, sizeof(refresh));
+        }
+        ::ReleaseSRWLockExclusive(&g_PendingLock);
     }
 
     void BeginHold(void* entity, void* actor, void* model, void* const* nodes,
@@ -313,7 +502,10 @@ namespace
         // Ran inline, so the target is known now: what it attached plus what it parked.
         const uint32_t attached = CountFresh(*ResourceHead(model), nodes, count);
         if (parked == 0)
+        {
             ReleaseNodes(model, nodes, count);   // complete already, no doubled window at all
+            InvalidateMotion(actor);
+        }
         else
             BeginHold(entity, actor, model, nodes, count, parked, attached + parked);
     }
@@ -332,8 +524,8 @@ namespace
         void* actor = Read<void*>(entity, kEntityActor);
         if (actor == nullptr || ::IsBadReadPtr(actor, sizeof(void*)))
             return false;
-        if (Read<uint8_t>(entity, kEntityType) != 0)
-            return false;   // PCs only; mounts and other actor families keep the stock path
+        const uint8_t entityType  = Read<uint8_t>(entity, kEntityType);
+        const uint16_t actorLock = Read<uint16_t>(entity, kEntityActorLock);
 
         // Mirror the stock trigger condition exactly.
         const uint16_t modelFlags = Read<uint16_t>(entity, kEntityModelFlags);
@@ -342,6 +534,10 @@ namespace
             return false;
         if (g_Predicate(entity, nullptr) == 0)
             return false;
+
+        const bool serialized = IsAppearanceQueued(entity);
+        if (!NoBlinkPolicy::ShouldRebind(entityType, actorLock, serialized))
+            return false;   // non-PCs and unqueued locked presentations keep the stock behavior
 
         // Record the old look before touching anything, so an unrecognised layout can still
         // fall through to a fully stock teardown with the entity exactly as it expects.
@@ -364,7 +560,10 @@ namespace
         std::memcpy(static_cast<uint8_t*>(entity) + kEntityFlags0, &newFlags, sizeof(newFlags));
 
         if (count == 0)
+        {
             g_Loader(actor, nullptr, kSelector);   // nothing to preserve
+            InvalidateMotion(actor);
+        }
         else
             Rebind(entity, actor, model, nodes, count);
         return true;
@@ -501,7 +700,7 @@ public:
     }
     double GetVersion(void) const override
     {
-        return 1.0;
+        return 1.5;
     }
     double GetInterfaceVersion(void) const override
     {
@@ -514,6 +713,7 @@ public:
     uint32_t GetFlags(void) const override
     {
         return static_cast<uint32_t>(Ashita::PluginFlags::UseCommands) |
+               static_cast<uint32_t>(Ashita::PluginFlags::UsePackets) |
                static_cast<uint32_t>(Ashita::PluginFlags::UseDirect3D);
     }
 
@@ -563,6 +763,7 @@ public:
 
     void Release(void) override
     {
+        ClearAppearances();
         g_ParkHook.Remove();
         g_TeardownHook.Remove();
         this->Cleanup();
@@ -584,6 +785,51 @@ public:
                 std::memory_order_relaxed);
 
         this->ServiceHolds();
+        ProcessPendingAppearances();
+    }
+
+    bool HandleIncomingPacket(uint16_t id, uint32_t size, const uint8_t*, uint8_t* modified,
+        uint32_t, const uint8_t*, bool, bool blocked) override
+    {
+        if (id == 0x00A)
+        {
+            ClearAppearances();   // entity indices and actor pointers change across zones
+            return false;
+        }
+        if (blocked || modified == nullptr || !g_Enabled.load(std::memory_order_relaxed))
+            return false;
+
+        auto* memory = m_Core->GetMemoryManager();
+        auto* party  = memory ? memory->GetParty() : nullptr;
+        auto* ents   = memory ? memory->GetEntity() : nullptr;
+        if (party == nullptr || ents == nullptr)
+            return false;
+
+        void* entity = nullptr;
+        uint8_t* appearance = nullptr;
+
+        // Self appearance update: race, face, and eight visible equipment models at +0x04.
+        if (id == 0x51 && size >= 0x16)
+        {
+            entity = ents->GetRawEntity(party->GetMemberTargetIndex(0));
+            appearance = modified + 0x04;
+        }
+        // Rendered PC update: the same appearance block starts at +0x48.
+        else if (id == 0x0D && size >= 0x5A && Read<uint16_t>(modified, 0x48) != 0)
+        {
+            const uint16_t index = Read<uint16_t>(modified, 0x08);
+            if (index < 0x400 || index >= 0x700)
+                return false;
+            entity = ents->GetRawEntity(index);
+            appearance = modified + 0x48;
+        }
+        else
+            return false;
+
+        const bool isSelf = entity == ents->GetRawEntity(party->GetMemberTargetIndex(0));
+        if ((isSelf ? g_Self : g_Others).load(std::memory_order_relaxed))
+            PrepareAppearanceSequence(entity, appearance);
+        return false;
     }
 
     bool HandleCommand(int32_t, const char* command, bool) override
@@ -591,6 +837,7 @@ public:
         std::vector<std::string> args;
         if (Ashita::Commands::GetCommandArgs(command, &args) == 0 || args.empty())
             return false;
+
         if (_stricmp(args[0].c_str(), "/noblink") != 0)
             return false;
 
@@ -607,6 +854,8 @@ public:
         else if (_stricmp(verb, "on") == 0 || _stricmp(verb, "off") == 0)
         {
             g_Enabled.store(_stricmp(verb, "on") == 0, std::memory_order_relaxed);
+            if (!g_Enabled.load(std::memory_order_relaxed))
+                ClearAppearances();
             this->ReportState();
         }
         else if (_stricmp(verb, "self") == 0)
@@ -639,6 +888,8 @@ private:
             this->Report("expected on, off, or nothing to toggle");
             return;
         }
+        if (!flag.load(std::memory_order_relaxed))
+            ClearAppearances();
         this->ReportState();
     }
 
@@ -708,6 +959,7 @@ private:
                 continue;
 
             ReleaseNodes(hold.Model, hold.Nodes, hold.Count);
+            InvalidateMotion(hold.Actor);
             hold.Entity = nullptr;
         }
     }

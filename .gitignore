@@ -3,5 +3,7 @@ NoBlink.dll
 NoBlink.exp
 NoBlink.lib
 NoBlink.obj
+NoBlinkPolicyTest.exe
+NoBlinkPolicyTest.obj
 *.pdb
 *.ilk

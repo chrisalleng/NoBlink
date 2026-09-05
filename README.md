@@ -12,6 +12,17 @@ where the resource chain starts empty, so a change means destroy and rebuild.
 NoBlink skips that teardown and rebinds the presentation on the live actor instead. The actor is
 never destroyed, so there is nothing to blink and nothing to lose a target on.
 
+After the rebind completes, NoBlink also invalidates the live actor's cached locomotion clip. The
+stock rebuild normally does this by constructing a new actor; without it, a weapon-style change
+such as sword-and-shield to a two-handed weapon can keep using the old shield run animation.
+
+Lockstyle and other multi-slot appearance changes are serialized through the same safe one-slot
+path. NoBlink compares incoming appearance packets with the already-rendered entity before the
+client applies them, lets one changed model through, and queues the final look. Each remaining model
+is applied only after the prior rebind and any deferred resource loads have completed. This works
+for the local character and remote players, including lockstyle changes that do not originate from
+a local command, without handing the update back to the stock blinking teardown.
+
 ## Installation
 
 1. Open the [Releases](https://github.com/chrisalleng/NoBlink/releases) page.
@@ -92,9 +103,10 @@ patching something it does not recognise.
 ```
 
 Requires the Ashita v4 SDK and a Win32 MSVC toolchain — build from `vcvars32.bat`, not the x64
-environment. Both paths are `build.ps1` parameters if yours differ from the defaults. Ashita needs
-all three exports in `exports.def`; omitting `expDestroyPlugin` fails with a misleading "missing
-required exports".
+environment. Both paths are `build.ps1` parameters if yours differ from the defaults. The build
+runs the appearance-policy regression checks before compiling the plugin. Ashita needs all three
+exports in `exports.def`; omitting `expDestroyPlugin` fails with a misleading "missing required
+exports".
 
 ## License
 

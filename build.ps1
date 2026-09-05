@@ -16,10 +16,11 @@ $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not (Test-Path $VcVars)) { throw "vcvars32.bat not found at $VcVars" }
 if (-not (Test-Path (Join-Path $SdkPath 'Ashita.h'))) { throw "Ashita SDK not found at $SdkPath" }
 
+$test = 'cl /nologo /std:c++20 /EHsc /W4 /WX NoBlinkPolicyTest.cpp /Fe:NoBlinkPolicyTest.exe'
 $cl = 'cl /nologo /std:c++20 /EHsc /O2 /W4 /MD /LD /DWIN32 ' +
       "/I`"$SdkPath`" NoBlink.cpp /link /DEF:exports.def /OUT:NoBlink.dll psapi.lib"
 
-cmd /c "`"$VcVars`" >nul 2>&1 && cd /d `"$here`" && $cl"
+cmd /c "`"$VcVars`" >nul 2>&1 && cd /d `"$here`" && $test && NoBlinkPolicyTest.exe && $cl"
 if ($LASTEXITCODE -ne 0) { throw "build failed ($LASTEXITCODE)" }
 
 Write-Host "built $(Join-Path $here 'NoBlink.dll')"
